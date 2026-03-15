@@ -47,8 +47,12 @@ function getMissingRoleIds(member, roles) {
   return roles.filter((role) => !member.roles.cache.has(role.id)).map((role) => role.id);
 }
 
-function getGatewayRetryDelayMs(error) {
-  const retryAfterSeconds = Number(error?.data?.retry_after);
+function getRateLimitRetryDelayMs(error) {
+  const retryAfterSeconds = Number(
+    error?.data?.retry_after ??
+      error?.rawError?.retry_after ??
+      error?.retry_after,
+  );
 
   if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds <= 0) {
     return 0;
@@ -57,25 +61,36 @@ function getGatewayRetryDelayMs(error) {
   return Math.ceil(retryAfterSeconds * 1000) + 1000;
 }
 
-async function fetchAllMembersWithRetry(guild, maxAttempts = 4) {
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      return await guild.members.fetch();
-    } catch (error) {
-      const retryDelayMs = getGatewayRetryDelayMs(error);
+async function runWithInfiniteRateLimitRetry({ operation, contextLabel, guildId, memberId = null }) {
+  let attempt = 1;
 
-      if (retryDelayMs <= 0 || attempt >= maxAttempts) {
+  while (true) {
+    try {
+      return await operation();
+    } catch (error) {
+      const retryDelayMs = getRateLimitRetryDelayMs(error);
+
+      if (retryDelayMs <= 0) {
         throw error;
       }
 
+      const scope = memberId ? `guild ${guildId}, member ${memberId}` : `guild ${guildId}`;
+
       logger.warn(
-        `Member scan for guild ${guild.id} hit a gateway rate limit. Retrying in ${retryDelayMs} ms (attempt ${attempt + 1}/${maxAttempts}).`,
+        `${contextLabel} hit a rate limit for ${scope}. Retrying in ${retryDelayMs} ms (attempt ${attempt}).`,
       );
       await sleep(retryDelayMs);
+      attempt += 1;
     }
   }
+}
 
-  throw new Error(`Failed to fetch guild members for guild ${guild.id}.`);
+async function fetchAllMembersWithRetry(guild) {
+  return runWithInfiniteRateLimitRetry({
+    guildId: guild.id,
+    contextLabel: 'Member scan',
+    operation: () => guild.members.fetch(),
+  });
 }
 
 export async function validateRoleTargets(guild, roles) {
@@ -229,7 +244,13 @@ async function runRoleGrantJob({ guild, roles, memberIds, reason, delayMs, jobSt
   try {
     for (const memberId of memberIds) {
       const member =
-        guild.members.cache.get(memberId) ?? (await guild.members.fetch(memberId).catch(() => null));
+        guild.members.cache.get(memberId) ??
+        (await runWithInfiniteRateLimitRetry({
+          guildId: guild.id,
+          memberId,
+          contextLabel: 'Member fetch',
+          operation: () => guild.members.fetch(memberId),
+        }).catch(() => null));
 
       if (!member) {
         jobStore.recordFailure({ id: memberId }, new Error('Member is no longer available in the guild.'));
@@ -245,10 +266,16 @@ async function runRoleGrantJob({ guild, roles, memberIds, reason, delayMs, jobSt
         const missingRoleIds = getMissingRoleIds(member, roles);
 
         if (missingRoleIds.length > 0) {
-          await member.roles.add(
-            missingRoleIds.length === 1 ? missingRoleIds[0] : missingRoleIds,
-            reason,
-          );
+          await runWithInfiniteRateLimitRetry({
+            guildId: guild.id,
+            memberId: member.id,
+            contextLabel: 'Role grant',
+            operation: () =>
+              member.roles.add(
+                missingRoleIds.length === 1 ? missingRoleIds[0] : missingRoleIds,
+                reason,
+              ),
+          });
         }
 
         jobStore.recordSuccess();
