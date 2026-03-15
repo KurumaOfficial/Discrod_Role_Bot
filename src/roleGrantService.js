@@ -27,6 +27,26 @@ function normalizeError(error) {
   return String(error);
 }
 
+function dedupeRoles(roles) {
+  const seenIds = new Set();
+  const uniqueRoles = [];
+
+  for (const role of roles) {
+    if (!role || seenIds.has(role.id)) {
+      continue;
+    }
+
+    seenIds.add(role.id);
+    uniqueRoles.push(role);
+  }
+
+  return uniqueRoles;
+}
+
+function getMissingRoleIds(member, roles) {
+  return roles.filter((role) => !member.roles.cache.has(role.id)).map((role) => role.id);
+}
+
 function getGatewayRetryDelayMs(error) {
   const retryAfterSeconds = Number(error?.data?.retry_after);
 
@@ -58,8 +78,9 @@ async function fetchAllMembersWithRetry(guild, maxAttempts = 4) {
   throw new Error(`Failed to fetch guild members for guild ${guild.id}.`);
 }
 
-export async function validateRoleTarget(guild, role) {
+export async function validateRoleTargets(guild, roles) {
   const me = guild.members.me ?? (await guild.members.fetchMe());
+  const uniqueRoles = dedupeRoles(roles);
 
   if (!me) {
     return 'Bot member is not available in this guild yet. Try again in a few seconds.';
@@ -69,23 +90,26 @@ export async function validateRoleTarget(guild, role) {
     return 'Bot is missing the Manage Roles permission.';
   }
 
-  if (role.id === guild.id) {
-    return 'The @everyone role cannot be granted manually.';
-  }
+  for (const role of uniqueRoles) {
+    if (role.id === guild.id) {
+      return 'The @everyone role cannot be granted manually.';
+    }
 
-  if (role.managed) {
-    return 'Managed or integration roles cannot be granted manually.';
-  }
+    if (role.managed) {
+      return `Managed or integration roles cannot be granted manually: ${role.name}.`;
+    }
 
-  if (!role.editable) {
-    return 'This role is above the bot role or otherwise not editable.';
+    if (!role.editable) {
+      return `This role is above the bot role or otherwise not editable: ${role.name}.`;
+    }
   }
 
   return null;
 }
 
-export async function buildGrantPreview({ guild, role, includeBots }) {
+export async function buildGrantPreview({ guild, roles, includeBots }) {
   const me = guild.members.me ?? (await guild.members.fetchMe());
+  const uniqueRoles = dedupeRoles(roles);
 
   if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) {
     throw new Error('Bot is missing the Manage Roles permission.');
@@ -107,7 +131,7 @@ export async function buildGrantPreview({ guild, role, includeBots }) {
       continue;
     }
 
-    if (member.roles.cache.has(role.id)) {
+    if (getMissingRoleIds(member, uniqueRoles).length === 0) {
       preview.skippedExisting += 1;
       continue;
     }
@@ -130,7 +154,7 @@ export async function buildGrantPreview({ guild, role, includeBots }) {
 export async function startRoleGrantJob({
   client,
   guildId,
-  roleId,
+  roleIds,
   requestedBy,
   includeBots,
   reason,
@@ -145,13 +169,20 @@ export async function startRoleGrantJob({
   }
 
   const guild = await client.guilds.fetch(guildId).then((entry) => entry.fetch());
-  const role = await guild.roles.fetch(roleId);
+  const roles = [];
 
-  if (!role) {
-    throw new Error('Role not found.');
+  for (const roleId of roleIds) {
+    const role = await guild.roles.fetch(roleId);
+
+    if (!role) {
+      throw new Error(`Role not found: ${roleId}`);
+    }
+
+    roles.push(role);
   }
 
-  const validationError = await validateRoleTarget(guild, role);
+  const uniqueRoles = dedupeRoles(roles);
+  const validationError = await validateRoleTargets(guild, uniqueRoles);
 
   if (validationError) {
     throw new Error(validationError);
@@ -163,10 +194,10 @@ export async function startRoleGrantJob({
           ...preparedPreview,
           memberIds: preparedMemberIds,
         }
-      : await buildGrantPreview({ guild, role, includeBots });
+      : await buildGrantPreview({ guild, roles: uniqueRoles, includeBots });
   const job = jobStore.startJob({
     guild,
-    role,
+    roles: uniqueRoles,
     requestedBy,
     includeBots,
     reason,
@@ -176,7 +207,7 @@ export async function startRoleGrantJob({
 
   void runRoleGrantJob({
     guild,
-    role,
+    roles: uniqueRoles,
     memberIds: preview.memberIds,
     reason,
     delayMs,
@@ -190,8 +221,10 @@ export async function startRoleGrantJob({
   };
 }
 
-async function runRoleGrantJob({ guild, role, memberIds, reason, delayMs, jobStore, reportDirectory }) {
-  logger.info(`Starting Kuruma bulk role grant for ${memberIds.length} members in guild ${guild.id}.`);
+async function runRoleGrantJob({ guild, roles, memberIds, reason, delayMs, jobStore, reportDirectory }) {
+  logger.info(
+    `Starting Kuruma bulk role grant for ${memberIds.length} members and ${roles.length} roles in guild ${guild.id}.`,
+  );
 
   try {
     for (const memberId of memberIds) {
@@ -209,7 +242,15 @@ async function runRoleGrantJob({ guild, role, memberIds, reason, delayMs, jobSto
       }
 
       try {
-        await member.roles.add(role, reason);
+        const missingRoleIds = getMissingRoleIds(member, roles);
+
+        if (missingRoleIds.length > 0) {
+          await member.roles.add(
+            missingRoleIds.length === 1 ? missingRoleIds[0] : missingRoleIds,
+            reason,
+          );
+        }
+
         jobStore.recordSuccess();
       } catch (error) {
         jobStore.recordFailure(member, error);

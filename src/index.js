@@ -21,7 +21,7 @@ import {
   buildGrantPreview,
   formatRoleGrantError,
   startRoleGrantJob,
-  validateRoleTarget,
+  validateRoleTargets,
 } from './roleGrantService.js';
 
 const client = new Client({
@@ -31,7 +31,7 @@ const client = new Client({
 const jobStore = new JobStore();
 const pendingGrantStore = new PendingGrantStore(config.pendingGrantTtlMs);
 const JOB_PROGRESS_UPDATE_INTERVAL_MS = 2000;
-const JOB_PROGRESS_WATCH_TIMEOUT_MS = 14 * 60 * 1000;
+const JOB_PROGRESS_WATCH_TIMEOUT_MS = 8 * 60 * 60 * 1000;
 const PROGRESS_BAR_WIDTH = 16;
 
 function sleep(milliseconds) {
@@ -73,6 +73,19 @@ function buildProgressBar(processed, total) {
   const empty = PROGRESS_BAR_WIDTH - filled;
 
   return `[${'#'.repeat(filled)}${'-'.repeat(empty)}] ${Math.round(ratio * 100)}%`;
+}
+
+function buildRolesFieldValue(rolesOrJob, maxLength = 1024) {
+  const roleNames = Array.isArray(rolesOrJob)
+    ? rolesOrJob.map((role) => role.name)
+    : rolesOrJob.roleNames ?? [rolesOrJob.roleName];
+  const roleIds = Array.isArray(rolesOrJob)
+    ? rolesOrJob.map((role) => role.id)
+    : rolesOrJob.roleIds ?? [rolesOrJob.roleId];
+  const lines = roleNames.map((roleName, index) => `${index + 1}. ${roleName} (${roleIds[index]})`);
+  const output = lines.join('\n');
+
+  return output.length <= maxLength ? output : output.slice(0, maxLength);
 }
 
 function getJobMetrics(job) {
@@ -130,7 +143,7 @@ function buildLiveGrantEmbed(job) {
       { name: 'Status', value: buildJobStateLabel(job), inline: true },
       { name: 'Progress', value: `${job.processed}/${job.eligibleCount}`, inline: true },
       { name: 'Progress Bar', value: metrics.progressBar },
-      { name: 'Role', value: `${job.roleName} (${job.roleId})` },
+      { name: 'Roles', value: buildRolesFieldValue(job) },
       { name: 'Granted', value: String(job.granted), inline: true },
       { name: 'Failed', value: String(job.failed), inline: true },
       { name: 'Skipped Before Start', value: String(skippedBeforeStart), inline: true },
@@ -166,14 +179,14 @@ function buildLiveGrantEmbed(job) {
   return embed;
 }
 
-function buildPreviewEmbed({ guild, role, preview, includeBots, reason }) {
+function buildPreviewEmbed({ guild, roles, preview, includeBots, reason }) {
   return new EmbedBuilder()
     .setColor(0x2f7d32)
     .setTitle('Kuruma Bulk Role Grant Preview')
     .setDescription('Review the numbers below and confirm the bulk role grant.')
     .addFields(
       { name: 'Guild', value: `${guild.name} (${guild.id})` },
-      { name: 'Role', value: `${role.name} (${role.id})` },
+      { name: 'Roles', value: buildRolesFieldValue(roles) },
       { name: 'Will Grant', value: String(preview.eligibleCount), inline: true },
       { name: 'Skip Bots', value: String(preview.skippedBots), inline: true },
       { name: 'Skip Existing', value: String(preview.skippedExisting), inline: true },
@@ -202,7 +215,7 @@ function buildStatusEmbed({ guild, activeJob, lastJob }) {
     const metrics = getJobMetrics(activeJob);
 
     embed.addFields(
-      { name: 'Active Role', value: `${activeJob.roleName} (${activeJob.roleId})` },
+      { name: 'Active Roles', value: buildRolesFieldValue(activeJob) },
       { name: 'Progress', value: `${activeJob.processed}/${activeJob.eligibleCount} processed`, inline: true },
       { name: 'Progress Bar', value: metrics.progressBar },
       { name: 'Granted', value: String(activeJob.granted), inline: true },
@@ -254,7 +267,7 @@ function buildPermissionError() {
 function isKnownInteractionResponseError(error) {
   return (
     error instanceof DiscordAPIError &&
-    [10015, 10062, 40060, 50027].includes(error.code)
+    [10008, 10015, 10062, 40060, 50027].includes(error.code)
   );
 }
 
@@ -295,13 +308,13 @@ async function sendInteractionError(interaction, content) {
   }
 }
 
-async function safeEditInteractionReply(interaction, payload) {
+async function safeEditTrackedMessage(message, payload) {
   try {
-    await interaction.editReply(payload);
+    await message.edit(payload);
     return true;
   } catch (error) {
     if (isKnownInteractionResponseError(error)) {
-      logger.warn('Kuruma stopped live progress updates because the interaction reply is no longer editable.');
+      logger.warn('Kuruma stopped live progress updates because the tracker message is no longer editable.');
       return false;
     }
 
@@ -325,7 +338,7 @@ function getTrackedJob(jobId) {
   return null;
 }
 
-async function watchJobProgressMessage(interaction, jobId) {
+async function watchJobProgressMessage(message, jobId) {
   const startedWatchingAt = Date.now();
   let lastSnapshotKey = '';
   let waitsForFinalReport = 0;
@@ -350,7 +363,7 @@ async function watchJobProgressMessage(interaction, jobId) {
     ].join(':');
 
     if (snapshotKey !== lastSnapshotKey) {
-      const updated = await safeEditInteractionReply(interaction, {
+      const updated = await safeEditTrackedMessage(message, {
         embeds: [buildLiveGrantEmbed(trackedJob)],
         components: [],
       });
@@ -436,19 +449,41 @@ async function handleGrantRole(interaction) {
   }
 
   try {
-    const selectedRole = interaction.options.getRole('role', true);
-    const role =
-      interaction.guild.roles.cache.get(selectedRole.id) ??
-      (await interaction.guild.roles.fetch(selectedRole.id));
+    const selectedPrimaryRole = interaction.options.getRole('role', true);
+    const selectedSecondRole = interaction.options.getRole('second_role');
+    const roles = [];
+    const primaryRole =
+      interaction.guild.roles.cache.get(selectedPrimaryRole.id) ??
+      (await interaction.guild.roles.fetch(selectedPrimaryRole.id));
     const includeBots = interaction.options.getBoolean('include_bots') ?? !config.skipBotsByDefault;
     const reason = interaction.options.getString('reason')?.trim() || config.defaultGrantReason;
 
-    if (!role) {
-      await interaction.editReply({ content: 'Role not found in this guild.' });
+    if (!primaryRole) {
+      await interaction.editReply({ content: 'Primary role not found in this guild.' });
       return;
     }
 
-    const validationError = await validateRoleTarget(interaction.guild, role);
+    roles.push(primaryRole);
+
+    if (selectedSecondRole) {
+      if (selectedSecondRole.id === selectedPrimaryRole.id) {
+        await interaction.editReply({ content: 'The second role must be different from the primary role.' });
+        return;
+      }
+
+      const secondRole =
+        interaction.guild.roles.cache.get(selectedSecondRole.id) ??
+        (await interaction.guild.roles.fetch(selectedSecondRole.id));
+
+      if (!secondRole) {
+        await interaction.editReply({ content: 'Second role not found in this guild.' });
+        return;
+      }
+
+      roles.push(secondRole);
+    }
+
+    const validationError = await validateRoleTargets(interaction.guild, roles);
 
     if (validationError) {
       await interaction.editReply({ content: validationError });
@@ -457,15 +492,16 @@ async function handleGrantRole(interaction) {
 
     const preview = await buildGrantPreview({
       guild: interaction.guild,
-      role,
+      roles,
       includeBots,
     });
     const token = pendingGrantStore.create({
       guildId: interaction.guildId,
-      roleId: role.id,
+      roleIds: roles.map((role) => role.id),
       includeBots,
       reason,
       requestedBy: interaction.user.id,
+      roleNames: roles.map((role) => role.name),
       preview: {
         totalMembers: preview.totalMembers,
         eligibleCount: preview.eligibleCount,
@@ -487,7 +523,7 @@ async function handleGrantRole(interaction) {
     );
 
     await interaction.editReply({
-      embeds: [buildPreviewEmbed({ guild: interaction.guild, role, preview, includeBots, reason })],
+      embeds: [buildPreviewEmbed({ guild: interaction.guild, roles, preview, includeBots, reason })],
       components: [row],
     });
   } catch (error) {
@@ -519,10 +555,19 @@ async function handleGrantConfirm(interaction, token) {
   pendingGrantStore.consume(token);
 
   try {
+    if (!interaction.channel?.isTextBased()) {
+      await interaction.editReply({
+        content: 'Kuruma can only post a live tracker in a text-based guild channel.',
+        embeds: [],
+        components: [],
+      });
+      return;
+    }
+
     const { job, preview } = await startRoleGrantJob({
       client,
       guildId: entry.guildId,
-      roleId: entry.roleId,
+      roleIds: entry.roleIds,
       requestedBy: entry.requestedBy,
       includeBots: entry.includeBots,
       reason: entry.reason,
@@ -532,18 +577,22 @@ async function handleGrantConfirm(interaction, token) {
       preparedPreview: entry.preview,
       preparedMemberIds: entry.memberIds,
     });
-
-    await interaction.editReply({
+    const trackerMessage = await interaction.channel.send({
       embeds: [
         buildLiveGrantEmbed({
           ...job,
           eligibleCount: preview.eligibleCount,
         }),
       ],
+    });
+
+    await interaction.editReply({
+      content: `Kuruma started the bulk role grant. Public tracker: ${trackerMessage.url}`,
+      embeds: [],
       components: [],
     });
 
-    void watchJobProgressMessage(interaction, job.id);
+    void watchJobProgressMessage(trackerMessage, job.id);
   } catch (error) {
     logger.error('Failed to start Kuruma bulk role grant.', error);
     await interaction.editReply({

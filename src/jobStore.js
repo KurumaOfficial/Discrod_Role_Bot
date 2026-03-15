@@ -30,18 +30,23 @@ export class JobStore {
     return this.activeJob !== null;
   }
 
-  startJob({ guild, role, requestedBy, includeBots, reason, delayMs, preview }) {
+  startJob({ guild, roles, requestedBy, includeBots, reason, delayMs, preview }) {
     if (this.activeJob) {
       throw new Error('A role grant job is already running.');
     }
+
+    const roleIds = roles.map((role) => role.id);
+    const roleNames = roles.map((role) => role.name);
 
     this.activeJob = {
       id: crypto.randomUUID(),
       status: 'running',
       guildId: guild.id,
       guildName: guild.name,
-      roleId: role.id,
-      roleName: role.name,
+      roleIds,
+      roleNames,
+      roleId: roleIds.join(', '),
+      roleName: roleNames.join(', '),
       requestedBy,
       includeBots,
       reason,

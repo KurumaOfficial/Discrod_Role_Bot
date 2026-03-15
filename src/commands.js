@@ -10,10 +10,16 @@ export function buildCommandDefinitions() {
       .setDefaultMemberPermissions(defaultPermissions),
     new SlashCommandBuilder()
       .setName('grantrole')
-      .setDescription('Preview and start a safe bulk role grant.')
+      .setDescription('Preview and start a safe bulk role grant for one or two roles.')
       .setDefaultMemberPermissions(defaultPermissions)
       .addRoleOption((option) =>
-        option.setName('role').setDescription('Role to grant to members.').setRequired(true),
+        option.setName('role').setDescription('Primary role to grant to members.').setRequired(true),
+      )
+      .addRoleOption((option) =>
+        option
+          .setName('second_role')
+          .setDescription('Optional second role to grant in the same job.')
+          .setRequired(false),
       )
       .addBooleanOption((option) =>
         option
