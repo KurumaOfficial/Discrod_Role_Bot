@@ -359,7 +359,7 @@ async function handleGrantCancel(interaction, token) {
   });
 }
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   logger.info(`Logged in as ${client.user.tag}.`);
 
   try {
