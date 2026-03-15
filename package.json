@@ -1,7 +1,7 @@
 {
   "name": "discrod-role-bot",
-  "version": "1.0.0",
-  "description": "Kuruma's Discord role snapshot and restore dashboard",
+  "version": "2.0.0",
+  "description": "Kuruma's Discord bot for safe bulk role grants after server migration",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -11,10 +11,10 @@
   },
   "keywords": [
     "discord",
+    "bot",
     "roles",
-    "restore",
-    "snapshot",
-    "dashboard"
+    "bulk-grant",
+    "migration"
   ],
   "author": "Kuruma",
   "license": "MIT",
@@ -22,9 +22,7 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "discord.js": "^14.20.0",
-    "dotenv": "^17.2.3",
-    "express": "^4.21.2",
-    "multer": "^2.0.2"
+    "discord.js": "^14.21.0",
+    "dotenv": "^17.2.3"
   }
 }

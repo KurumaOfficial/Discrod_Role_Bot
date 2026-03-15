@@ -1,21 +1,17 @@
-import { spawnSync } from 'node:child_process';
-import fs from 'node:fs/promises';
+import { readdir } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const rootDir = path.resolve(__dirname, '..');
-const srcDir = path.join(rootDir, 'src');
+import process from 'node:process';
+import { spawnSync } from 'node:child_process';
 
 async function collectJavaScriptFiles(directory) {
-  const entries = await fs.readdir(directory, { withFileTypes: true });
+  const entries = await readdir(directory, { withFileTypes: true });
   const files = [];
 
   for (const entry of entries) {
     const fullPath = path.join(directory, entry.name);
 
     if (entry.isDirectory()) {
-      files.push(...await collectJavaScriptFiles(fullPath));
+      files.push(...(await collectJavaScriptFiles(fullPath)));
       continue;
     }
 
@@ -27,18 +23,26 @@ async function collectJavaScriptFiles(directory) {
   return files;
 }
 
-const files = await collectJavaScriptFiles(srcDir);
+async function main() {
+  const targets = [path.join(process.cwd(), 'src'), path.join(process.cwd(), 'scripts')];
+  const files = [];
 
-for (const filePath of files) {
-  const checkResult = spawnSync(process.execPath, ['--check', filePath], {
-    cwd: rootDir,
-    encoding: 'utf8'
-  });
-
-  if (checkResult.status !== 0) {
-    process.stderr.write(checkResult.stderr || checkResult.stdout);
-    process.exit(checkResult.status ?? 1);
+  for (const target of targets) {
+    files.push(...(await collectJavaScriptFiles(target)));
   }
+
+  for (const file of files) {
+    const result = spawnSync(process.execPath, ['--check', file], { stdio: 'inherit' });
+
+    if (result.status !== 0) {
+      process.exit(result.status ?? 1);
+    }
+  }
+
+  console.log(`Kuruma syntax check passed for ${files.length} files.`);
 }
 
-process.stdout.write(`Kuruma syntax check passed for ${files.length} file(s).\n`);
+main().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

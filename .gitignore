@@ -1,8 +1,4 @@
 node_modules/
 .env
-data/state.json
-data/snapshots/*.json
 data/reports/*.json
-!data/snapshots/.gitkeep
-!data/reports/.gitkeep
 npm-debug.log*

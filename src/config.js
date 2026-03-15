@@ -1,39 +1,70 @@
-import dotenv from 'dotenv';
+import path from 'node:path';
+import process from 'node:process';
 
-dotenv.config({ quiet: true });
+import 'dotenv/config';
 
-function toBoolean(value, fallback = false) {
-  if (value === undefined || value === null || value === '') {
+function readInteger(name, fallback) {
+  const rawValue = process.env[name];
+
+  if (!rawValue) {
     return fallback;
   }
 
-  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase());
-}
+  const parsedValue = Number.parseInt(rawValue, 10);
 
-function toInteger(value, fallback) {
-  const parsed = Number.parseInt(String(value ?? ''), 10);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-export const config = Object.freeze({
-  brand: 'Kuruma Role Restorer',
-  botToken: process.env.DISCORD_BOT_TOKEN?.trim() ?? '',
-  dashboardHost: process.env.DASHBOARD_HOST?.trim() || '127.0.0.1',
-  dashboardPort: toInteger(process.env.DASHBOARD_PORT, 3007),
-  targetGuildId: process.env.TARGET_GUILD_ID?.trim() ?? '',
-  defaultRestoreDelayMs: Math.max(100, toInteger(process.env.DEFAULT_RESTORE_DELAY_MS, 250)),
-  defaultRestoreReason: (process.env.DEFAULT_RESTORE_REASON?.trim() || 'Kuruma role restore').slice(0, 512),
-  skipBotAccounts: toBoolean(process.env.SKIP_BOT_ACCOUNTS, true)
-});
-
-export function validateConfig() {
-  const missingVariables = [];
-
-  if (!config.botToken) {
-    missingVariables.push('DISCORD_BOT_TOKEN');
+  if (Number.isNaN(parsedValue)) {
+    throw new Error(`Environment variable ${name} must be an integer.`);
   }
 
-  if (missingVariables.length > 0) {
-    throw new Error(`Missing required environment variables: ${missingVariables.join(', ')}`);
+  return parsedValue;
+}
+
+function readBoolean(name, fallback) {
+  const rawValue = process.env[name];
+
+  if (!rawValue) {
+    return fallback;
+  }
+
+  if (rawValue === 'true') {
+    return true;
+  }
+
+  if (rawValue === 'false') {
+    return false;
+  }
+
+  throw new Error(`Environment variable ${name} must be true or false.`);
+}
+
+export const config = {
+  botToken: process.env.DISCORD_BOT_TOKEN?.trim() ?? '',
+  allowedGuildId: process.env.ALLOWED_GUILD_ID?.trim() ?? '',
+  roleGrantDelayMs: readInteger('ROLE_GRANT_DELAY_MS', 350),
+  skipBotsByDefault: readBoolean('SKIP_BOTS_BY_DEFAULT', true),
+  defaultGrantReason:
+    process.env.DEFAULT_GRANT_REASON?.trim() ||
+    'Kuruma bulk role grant after server migration',
+  reportDirectory: path.resolve(process.cwd(), process.env.REPORTS_DIR?.trim() || 'data/reports'),
+  pendingGrantTtlMs: 10 * 60 * 1000,
+};
+
+export function validateConfig() {
+  const missing = [];
+
+  if (!config.botToken || config.botToken.includes('PASTE_YOUR')) {
+    missing.push('DISCORD_BOT_TOKEN');
+  }
+
+  if (!config.allowedGuildId || config.allowedGuildId.includes('PASTE_YOUR')) {
+    missing.push('ALLOWED_GUILD_ID');
+  }
+
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+  }
+
+  if (config.roleGrantDelayMs < 0) {
+    throw new Error('ROLE_GRANT_DELAY_MS must be >= 0.');
   }
 }
