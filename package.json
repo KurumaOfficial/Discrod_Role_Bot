@@ -1,0 +1,30 @@
+{
+  "name": "discrod-role-bot",
+  "version": "1.0.0",
+  "description": "Kuruma's Discord role snapshot and restore dashboard",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "check": "node scripts/check-syntax.mjs"
+  },
+  "keywords": [
+    "discord",
+    "roles",
+    "restore",
+    "snapshot",
+    "dashboard"
+  ],
+  "author": "Kuruma",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.20.0",
+    "dotenv": "^17.2.3",
+    "express": "^4.21.2",
+    "multer": "^2.0.2"
+  }
+}
