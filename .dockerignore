@@ -1,0 +1,7 @@
+.git
+.github
+.env
+bot.log
+node_modules
+npm-debug.log*
+data/reports/*.json
