@@ -27,6 +27,37 @@ function normalizeError(error) {
   return String(error);
 }
 
+function getGatewayRetryDelayMs(error) {
+  const retryAfterSeconds = Number(error?.data?.retry_after);
+
+  if (!Number.isFinite(retryAfterSeconds) || retryAfterSeconds <= 0) {
+    return 0;
+  }
+
+  return Math.ceil(retryAfterSeconds * 1000) + 1000;
+}
+
+async function fetchAllMembersWithRetry(guild, maxAttempts = 4) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await guild.members.fetch();
+    } catch (error) {
+      const retryDelayMs = getGatewayRetryDelayMs(error);
+
+      if (retryDelayMs <= 0 || attempt >= maxAttempts) {
+        throw error;
+      }
+
+      logger.warn(
+        `Member scan for guild ${guild.id} hit a gateway rate limit. Retrying in ${retryDelayMs} ms (attempt ${attempt + 1}/${maxAttempts}).`,
+      );
+      await sleep(retryDelayMs);
+    }
+  }
+
+  throw new Error(`Failed to fetch guild members for guild ${guild.id}.`);
+}
+
 export async function validateRoleTarget(guild, role) {
   const me = guild.members.me ?? (await guild.members.fetchMe());
 
@@ -60,7 +91,7 @@ export async function buildGrantPreview({ guild, role, includeBots }) {
     throw new Error('Bot is missing the Manage Roles permission.');
   }
 
-  const members = await guild.members.fetch();
+  const members = await fetchAllMembersWithRetry(guild);
   const memberIds = [];
   const preview = {
     totalMembers: members.size,
@@ -106,6 +137,8 @@ export async function startRoleGrantJob({
   delayMs,
   jobStore,
   reportDirectory,
+  preparedPreview = null,
+  preparedMemberIds = null,
 }) {
   if (jobStore.hasActiveJob()) {
     throw new Error('A role grant job is already running.');
@@ -124,7 +157,13 @@ export async function startRoleGrantJob({
     throw new Error(validationError);
   }
 
-  const preview = await buildGrantPreview({ guild, role, includeBots });
+  const preview =
+    preparedPreview && Array.isArray(preparedMemberIds)
+      ? {
+          ...preparedPreview,
+          memberIds: preparedMemberIds,
+        }
+      : await buildGrantPreview({ guild, role, includeBots });
   const job = jobStore.startJob({
     guild,
     role,

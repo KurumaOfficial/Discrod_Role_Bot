@@ -5,8 +5,10 @@ import {
   ButtonBuilder,
   ButtonStyle,
   Client,
+  DiscordAPIError,
   EmbedBuilder,
   GatewayIntentBits,
+  MessageFlags,
   PermissionFlagsBits,
 } from 'discord.js';
 
@@ -144,10 +146,48 @@ function buildStatusEmbed({ guild, activeJob, lastJob }) {
 }
 
 function buildPermissionError() {
-  return {
-    content: 'You need the Manage Roles permission to use Kuruma bulk role commands.',
-    ephemeral: true,
-  };
+  return 'You need the Manage Roles permission to use Kuruma bulk role commands.';
+}
+
+function isKnownInteractionResponseError(error) {
+  return error instanceof DiscordAPIError && (error.code === 10062 || error.code === 40060);
+}
+
+async function sendInteractionError(interaction, content) {
+  if (!interaction.isRepliable()) {
+    return;
+  }
+
+  try {
+    if (interaction.deferred && !interaction.replied) {
+      await interaction.editReply({
+        content,
+        embeds: [],
+        components: [],
+      });
+      return;
+    }
+
+    if (!interaction.replied) {
+      await interaction.reply({
+        content,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    await interaction.followUp({
+      content,
+      flags: MessageFlags.Ephemeral,
+    });
+  } catch (error) {
+    if (isKnownInteractionResponseError(error)) {
+      logger.warn('Kuruma could not deliver an interaction error message because the interaction was no longer valid.');
+      return;
+    }
+
+    throw error;
+  }
 }
 
 function ensureAllowedGuild(guildId) {
@@ -169,51 +209,47 @@ async function registerCommands() {
 }
 
 async function handleStatus(interaction) {
+  await interaction.deferReply({
+    flags: MessageFlags.Ephemeral,
+  });
+
   if (!interaction.inGuild() || !ensureAllowedGuild(interaction.guildId)) {
-    await interaction.reply({
-      content: 'Kuruma is locked to the guild configured in ALLOWED_GUILD_ID.',
-      ephemeral: true,
-    });
+    await interaction.editReply('Kuruma is locked to the guild configured in ALLOWED_GUILD_ID.');
     return;
   }
 
   if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageRoles)) {
-    await interaction.reply(buildPermissionError());
+    await interaction.editReply(buildPermissionError());
     return;
   }
 
   const activeJob = jobStore.getActiveJob();
   const lastJob = jobStore.getLastJob();
 
-  await interaction.reply({
+  await interaction.editReply({
     embeds: [buildStatusEmbed({ guild: interaction.guild, activeJob, lastJob })],
-    ephemeral: true,
   });
 }
 
 async function handleGrantRole(interaction) {
+  await interaction.deferReply({
+    flags: MessageFlags.Ephemeral,
+  });
+
   if (!interaction.inGuild() || !ensureAllowedGuild(interaction.guildId)) {
-    await interaction.reply({
-      content: 'Kuruma is locked to the guild configured in ALLOWED_GUILD_ID.',
-      ephemeral: true,
-    });
+    await interaction.editReply('Kuruma is locked to the guild configured in ALLOWED_GUILD_ID.');
     return;
   }
 
   if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageRoles)) {
-    await interaction.reply(buildPermissionError());
+    await interaction.editReply(buildPermissionError());
     return;
   }
 
   if (jobStore.hasActiveJob()) {
-    await interaction.reply({
-      content: 'A Kuruma bulk role grant is already running. Use /status to track it.',
-      ephemeral: true,
-    });
+    await interaction.editReply('A Kuruma bulk role grant is already running. Use /status to track it.');
     return;
   }
-
-  await interaction.deferReply({ ephemeral: true });
 
   try {
     const selectedRole = interaction.options.getRole('role', true);
@@ -246,6 +282,14 @@ async function handleGrantRole(interaction) {
       includeBots,
       reason,
       requestedBy: interaction.user.id,
+      preview: {
+        totalMembers: preview.totalMembers,
+        eligibleCount: preview.eligibleCount,
+        skippedBots: preview.skippedBots,
+        skippedExisting: preview.skippedExisting,
+        skippedUnmanageable: preview.skippedUnmanageable,
+      },
+      memberIds: preview.memberIds,
     });
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -274,7 +318,7 @@ async function handleGrantConfirm(interaction, token) {
   if (!entry) {
     await interaction.reply({
       content: 'This Kuruma confirmation expired. Run /grantrole again.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -282,7 +326,7 @@ async function handleGrantConfirm(interaction, token) {
   if (entry.requestedBy !== interaction.user.id) {
     await interaction.reply({
       content: 'Only the admin who created this preview can confirm it.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -301,6 +345,8 @@ async function handleGrantConfirm(interaction, token) {
       delayMs: config.roleGrantDelayMs,
       jobStore,
       reportDirectory: config.reportDirectory,
+      preparedPreview: entry.preview,
+      preparedMemberIds: entry.memberIds,
     });
     const guild = await client.guilds.fetch(entry.guildId).then((value) => value.fetch());
     const role = await guild.roles.fetch(entry.roleId);
@@ -337,7 +383,7 @@ async function handleGrantCancel(interaction, token) {
   if (!entry) {
     await interaction.reply({
       content: 'This Kuruma confirmation already expired.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -345,7 +391,7 @@ async function handleGrantCancel(interaction, token) {
   if (entry.requestedBy !== interaction.user.id) {
     await interaction.reply({
       content: 'Only the admin who created this preview can cancel it.',
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
     return;
   }
@@ -382,10 +428,12 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName === 'status') {
         await handleStatus(interaction);
+        return;
       }
 
       if (interaction.commandName === 'grantrole') {
         await handleGrantRole(interaction);
+        return;
       }
     }
 
@@ -393,27 +441,18 @@ client.on('interactionCreate', async (interaction) => {
       if (interaction.customId.startsWith('grant-confirm:')) {
         const token = interaction.customId.split(':')[1];
         await handleGrantConfirm(interaction, token);
+        return;
       }
 
       if (interaction.customId.startsWith('grant-cancel:')) {
         const token = interaction.customId.split(':')[1];
         await handleGrantCancel(interaction, token);
+        return;
       }
     }
   } catch (error) {
     logger.error('Kuruma interaction handler failed.', error);
-
-    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-      await interaction.reply({
-        content: 'Kuruma hit an unexpected error. Check the bot console.',
-        ephemeral: true,
-      });
-    } else if (interaction.isRepliable()) {
-      await interaction.followUp({
-        content: 'Kuruma hit an unexpected error. Check the bot console.',
-        ephemeral: true,
-      });
-    }
+    await sendInteractionError(interaction, 'Kuruma hit an unexpected error. Check the bot console.');
   }
 });
 
