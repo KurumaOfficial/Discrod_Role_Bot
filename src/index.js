@@ -30,6 +30,15 @@ const client = new Client({
 
 const jobStore = new JobStore();
 const pendingGrantStore = new PendingGrantStore(config.pendingGrantTtlMs);
+const JOB_PROGRESS_UPDATE_INTERVAL_MS = 2000;
+const JOB_PROGRESS_WATCH_TIMEOUT_MS = 14 * 60 * 1000;
+const PROGRESS_BAR_WIDTH = 16;
+
+function sleep(milliseconds) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, milliseconds);
+  });
+}
 
 function formatDuration(milliseconds) {
   if (!Number.isFinite(milliseconds) || milliseconds <= 0) {
@@ -55,6 +64,106 @@ function formatDuration(milliseconds) {
   }
 
   return parts.join(' ');
+}
+
+function buildProgressBar(processed, total) {
+  const safeTotal = total > 0 ? total : 1;
+  const ratio = Math.max(0, Math.min(processed / safeTotal, 1));
+  const filled = Math.round(ratio * PROGRESS_BAR_WIDTH);
+  const empty = PROGRESS_BAR_WIDTH - filled;
+
+  return `[${'#'.repeat(filled)}${'-'.repeat(empty)}] ${Math.round(ratio * 100)}%`;
+}
+
+function getJobMetrics(job) {
+  const finishedAtMs = job.finishedAt ? Date.parse(job.finishedAt) : Date.now();
+  const elapsedMs = Math.max(finishedAtMs - Date.parse(job.startedAt), 0);
+  const ratePerMinute =
+    job.processed > 0 && elapsedMs > 0 ? ((job.processed / elapsedMs) * 60000).toFixed(2) : '0.00';
+  const averageMs = job.processed > 0 ? elapsedMs / job.processed : job.delayMs;
+  const remaining = Math.max(job.eligibleCount - job.processed, 0);
+  const etaMs = job.status === 'running' ? remaining * averageMs : 0;
+
+  return {
+    elapsedMs,
+    ratePerMinute,
+    remaining,
+    etaMs,
+    progressBar: buildProgressBar(job.processed, job.eligibleCount),
+  };
+}
+
+function buildJobStateLabel(job) {
+  if (job.status === 'running') {
+    return 'RUNNING';
+  }
+
+  if (job.status === 'completed') {
+    return 'COMPLETED';
+  }
+
+  return 'FAILED';
+}
+
+function buildLiveGrantEmbed(job) {
+  const metrics = getJobMetrics(job);
+  const skippedBeforeStart = job.skippedBots + job.skippedExisting + job.skippedUnmanageable;
+  const isRunning = job.status === 'running';
+  const isCompleted = job.status === 'completed';
+  const embed = new EmbedBuilder()
+    .setColor(isRunning ? 0xf39c12 : isCompleted ? 0x2f7d32 : 0xc0392b)
+    .setTitle(
+      isRunning
+        ? 'Kuruma Bulk Role Grant Started'
+        : isCompleted
+          ? 'Kuruma Bulk Role Grant Completed'
+          : 'Kuruma Bulk Role Grant Failed',
+    )
+    .setDescription(
+      isRunning
+        ? 'Kuruma is updating this card while the queue runs.'
+        : isCompleted
+          ? 'The queue finished and this is the final result.'
+          : 'The queue stopped before completion. Review the error details below.',
+    )
+    .addFields(
+      { name: 'Status', value: buildJobStateLabel(job), inline: true },
+      { name: 'Progress', value: `${job.processed}/${job.eligibleCount}`, inline: true },
+      { name: 'Progress Bar', value: metrics.progressBar },
+      { name: 'Role', value: `${job.roleName} (${job.roleId})` },
+      { name: 'Granted', value: String(job.granted), inline: true },
+      { name: 'Failed', value: String(job.failed), inline: true },
+      { name: 'Skipped Before Start', value: String(skippedBeforeStart), inline: true },
+      { name: 'Rate', value: `${metrics.ratePerMinute} members/min`, inline: true },
+      { name: 'Elapsed', value: formatDuration(metrics.elapsedMs), inline: true },
+      {
+        name: isRunning ? 'ETA' : 'Delay',
+        value: isRunning ? formatDuration(metrics.etaMs) : `${job.delayMs} ms`,
+        inline: true,
+      },
+      { name: 'Job ID', value: job.id },
+    )
+    .setTimestamp();
+
+  if (job.reportPath) {
+    embed.addFields({ name: 'Report', value: job.reportPath });
+  }
+
+  if (job.fatalError) {
+    embed.addFields({ name: 'Fatal Error', value: job.fatalError.slice(0, 1024) });
+  }
+
+  if (job.errors.length > 0) {
+    const errorPreview = job.errors
+      .slice(0, 3)
+      .map((entry) => `${entry.memberId}: ${entry.error}`)
+      .join('\n')
+      .slice(0, 1024);
+
+    embed.addFields({ name: 'Latest Errors', value: errorPreview });
+  }
+
+  return embed;
 }
 
 function buildPreviewEmbed({ guild, role, preview, includeBots, reason }) {
@@ -90,19 +199,12 @@ function buildStatusEmbed({ guild, activeJob, lastJob }) {
     .setTimestamp();
 
   if (activeJob) {
-    const elapsedMs = Date.now() - Date.parse(activeJob.startedAt);
-    const ratePerMinute =
-      activeJob.processed > 0 && elapsedMs > 0
-        ? ((activeJob.processed / elapsedMs) * 60000).toFixed(2)
-        : '0.00';
-    const averageMs =
-      activeJob.processed > 0 ? elapsedMs / activeJob.processed : config.roleGrantDelayMs;
-    const remaining = Math.max(activeJob.eligibleCount - activeJob.processed, 0);
-    const etaMs = remaining * averageMs;
+    const metrics = getJobMetrics(activeJob);
 
     embed.addFields(
       { name: 'Active Role', value: `${activeJob.roleName} (${activeJob.roleId})` },
       { name: 'Progress', value: `${activeJob.processed}/${activeJob.eligibleCount} processed`, inline: true },
+      { name: 'Progress Bar', value: metrics.progressBar },
       { name: 'Granted', value: String(activeJob.granted), inline: true },
       { name: 'Failed', value: String(activeJob.failed), inline: true },
       {
@@ -110,9 +212,9 @@ function buildStatusEmbed({ guild, activeJob, lastJob }) {
         value: `${activeJob.skippedBots + activeJob.skippedExisting + activeJob.skippedUnmanageable}`,
         inline: true,
       },
-      { name: 'Rate', value: `${ratePerMinute} members/min`, inline: true },
-      { name: 'Elapsed', value: formatDuration(elapsedMs), inline: true },
-      { name: 'ETA', value: formatDuration(etaMs), inline: true },
+      { name: 'Rate', value: `${metrics.ratePerMinute} members/min`, inline: true },
+      { name: 'Elapsed', value: formatDuration(metrics.elapsedMs), inline: true },
+      { name: 'ETA', value: formatDuration(metrics.etaMs), inline: true },
     );
 
     if (activeJob.errors.length > 0) {
@@ -150,7 +252,10 @@ function buildPermissionError() {
 }
 
 function isKnownInteractionResponseError(error) {
-  return error instanceof DiscordAPIError && (error.code === 10062 || error.code === 40060);
+  return (
+    error instanceof DiscordAPIError &&
+    [10015, 10062, 40060, 50027].includes(error.code)
+  );
 }
 
 async function sendInteractionError(interaction, content) {
@@ -187,6 +292,85 @@ async function sendInteractionError(interaction, content) {
     }
 
     throw error;
+  }
+}
+
+async function safeEditInteractionReply(interaction, payload) {
+  try {
+    await interaction.editReply(payload);
+    return true;
+  } catch (error) {
+    if (isKnownInteractionResponseError(error)) {
+      logger.warn('Kuruma stopped live progress updates because the interaction reply is no longer editable.');
+      return false;
+    }
+
+    throw error;
+  }
+}
+
+function getTrackedJob(jobId) {
+  const activeJob = jobStore.getActiveJob();
+
+  if (activeJob?.id === jobId) {
+    return activeJob;
+  }
+
+  const lastJob = jobStore.getLastJob();
+
+  if (lastJob?.id === jobId) {
+    return lastJob;
+  }
+
+  return null;
+}
+
+async function watchJobProgressMessage(interaction, jobId) {
+  const startedWatchingAt = Date.now();
+  let lastSnapshotKey = '';
+  let waitsForFinalReport = 0;
+
+  while (Date.now() - startedWatchingAt < JOB_PROGRESS_WATCH_TIMEOUT_MS) {
+    const trackedJob = getTrackedJob(jobId);
+
+    if (!trackedJob) {
+      return;
+    }
+
+    const waitingForReport =
+      trackedJob.status !== 'running' && !trackedJob.reportPath && waitsForFinalReport < 3;
+    const snapshotKey = [
+      trackedJob.status,
+      trackedJob.processed,
+      trackedJob.granted,
+      trackedJob.failed,
+      trackedJob.errors.length,
+      trackedJob.fatalError ?? '',
+      trackedJob.reportPath ?? '',
+    ].join(':');
+
+    if (snapshotKey !== lastSnapshotKey) {
+      const updated = await safeEditInteractionReply(interaction, {
+        embeds: [buildLiveGrantEmbed(trackedJob)],
+        components: [],
+      });
+
+      if (!updated) {
+        return;
+      }
+
+      lastSnapshotKey = snapshotKey;
+    }
+
+    if (trackedJob.status !== 'running') {
+      if (waitingForReport) {
+        waitsForFinalReport += 1;
+      } else {
+        return;
+      }
+    }
+
+    await sleep(JOB_PROGRESS_UPDATE_INTERVAL_MS);
   }
 }
 
@@ -348,25 +532,18 @@ async function handleGrantConfirm(interaction, token) {
       preparedPreview: entry.preview,
       preparedMemberIds: entry.memberIds,
     });
-    const guild = await client.guilds.fetch(entry.guildId).then((value) => value.fetch());
-    const role = await guild.roles.fetch(entry.roleId);
 
     await interaction.editReply({
       embeds: [
-        new EmbedBuilder()
-          .setColor(0x2f7d32)
-          .setTitle('Kuruma Bulk Role Grant Started')
-          .setDescription('The job is running in the background. Use /status to watch the metrics.')
-          .addFields(
-            { name: 'Job ID', value: job.id },
-            { name: 'Role', value: role ? `${role.name} (${role.id})` : entry.roleId },
-            { name: 'Queued Members', value: String(preview.eligibleCount), inline: true },
-            { name: 'Delay', value: `${config.roleGrantDelayMs} ms`, inline: true },
-          )
-          .setTimestamp(),
+        buildLiveGrantEmbed({
+          ...job,
+          eligibleCount: preview.eligibleCount,
+        }),
       ],
       components: [],
     });
+
+    void watchJobProgressMessage(interaction, job.id);
   } catch (error) {
     logger.error('Failed to start Kuruma bulk role grant.', error);
     await interaction.editReply({
